@@ -1,19 +1,29 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "proxy.h"
+#include "dapf.h"
 #include "dart.h"
+#include "display.h"
 #include "exception.h"
+#include "fb.h"
+#include "gxf.h"
 #include "heapblock.h"
+#include "hv.h"
 #include "iodev.h"
 #include "kboot.h"
 #include "malloc.h"
+#include "mcc.h"
 #include "memory.h"
+#include "nvme.h"
+#include "pcie.h"
 #include "pmgr.h"
 #include "smp.h"
 #include "string.h"
 #include "tunables.h"
 #include "types.h"
 #include "uart.h"
+#include "uartproxy.h"
+#include "usb.h"
 #include "utils.h"
 #include "xnuboot.h"
 
@@ -31,11 +41,13 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_NOP:
             break;
         case P_EXIT:
-            return 0;
+            if (request->args[0])
+                return request->args[0];
+            return 1;
         case P_CALL: {
             generic_func *f = (generic_func *)request->args[0];
-            reply->retval =
-                f(request->args[1], request->args[2], request->args[3], request->args[4]);
+            reply->retval = f(request->args[1], request->args[2], request->args[3],
+                              request->args[4], request->args[5]);
             break;
         }
         case P_GET_BOOTARGS:
@@ -46,7 +58,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_SET_BAUD: {
             int cnt = request->args[1];
-            printf("Changing baud rate to %d...\n", request->args[0]);
+            printf("Changing baud rate to %lu...\n", request->args[0]);
             uart_setbaud(request->args[0]);
             while (cnt--) {
                 uart_putbyte(request->args[2]);
@@ -76,9 +88,30 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                                      request->args[3], request->args[4]);
             break;
         case P_VECTOR:
+            // forcefully restore tps6598x IRQs
+            usb_hpm_restore_irqs(1);
+            iodev_console_flush();
             next_stage.entry = (generic_func *)request->args[0];
-            memcpy(next_stage.args, &request->args[1], 4 * sizeof(u64));
-            return 0;
+            memcpy(next_stage.args, &request->args[1], 5 * sizeof(u64));
+            next_stage.restore_logo = true;
+            return 1;
+        case P_GL1_CALL:
+            reply->retval = gl1_call((void *)request->args[0], request->args[1], request->args[2],
+                                     request->args[3], request->args[4]);
+            break;
+        case P_GL2_CALL:
+            reply->retval = gl2_call((void *)request->args[0], request->args[1], request->args[2],
+                                     request->args[3], request->args[4]);
+            break;
+        case P_GET_SIMD_STATE:
+            get_simd_state((void *)request->args[0]);
+            break;
+        case P_PUT_SIMD_STATE:
+            put_simd_state((void *)request->args[0]);
+            break;
+        case P_REBOOT:
+            reboot();
+            break;
 
         case P_WRITE64:
             exc_guard = GUARD_SKIP;
@@ -252,6 +285,18 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_MMU_SHUTDOWN:
             mmu_shutdown();
             break;
+        case P_MMU_INIT:
+            mmu_init();
+            break;
+        case P_MMU_DISABLE:
+            reply->retval = mmu_disable();
+            break;
+        case P_MMU_RESTORE:
+            mmu_restore(request->args[0]);
+            break;
+        case P_MMU_INIT_SECONDARY:
+            mmu_init_secondary(request->args[0]);
+            break;
 
         case P_XZDEC: {
             uint32_t destlen, srclen;
@@ -288,6 +333,12 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                       request->args[3], request->args[4], request->args[5]);
             reply->retval = smp_wait(request->args[0]);
             break;
+        case P_SMP_WAIT:
+            reply->retval = smp_wait(request->args[0]);
+            break;
+        case P_SMP_SET_WFE_MODE:
+            smp_set_wfe_mode(request->args[0]);
+            break;
 
         case P_HEAPBLOCK_ALLOC:
             reply->retval = (u64)heapblock_alloc(request->args[0]);
@@ -304,10 +355,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 
         case P_KBOOT_BOOT:
             if (kboot_boot((void *)request->args[0]) == 0)
-                return 0;
+                return 1;
             break;
-        case P_KBOOT_SET_BOOTARGS:
-            kboot_set_bootargs((void *)request->args[0]);
+        case P_KBOOT_SET_CHOSEN:
+            reply->retval = kboot_set_chosen((void *)request->args[0], (void *)request->args[1]);
             break;
         case P_KBOOT_SET_INITRD:
             kboot_set_initrd((void *)request->args[0], request->args[1]);
@@ -316,17 +367,20 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = kboot_prepare_dt((void *)request->args[0]);
             break;
 
-        case P_PMGR_CLOCK_ENABLE:
-            reply->retval = pmgr_clock_enable(request->args[0]);
+        case P_PMGR_POWER_ENABLE:
+            reply->retval = pmgr_power_enable(request->args[0]);
             break;
-        case P_PMGR_CLOCK_DISABLE:
-            reply->retval = pmgr_clock_enable(request->args[0]);
+        case P_PMGR_POWER_DISABLE:
+            reply->retval = pmgr_power_enable(request->args[0]);
             break;
-        case P_PMGR_ADT_CLOCKS_ENABLE:
-            reply->retval = pmgr_adt_clocks_enable((const char *)request->args[0]);
+        case P_PMGR_ADT_POWER_ENABLE:
+            reply->retval = pmgr_adt_power_enable((const char *)request->args[0]);
             break;
-        case P_PMGR_ADT_CLOCKS_DISABLE:
-            reply->retval = pmgr_adt_clocks_disable((const char *)request->args[0]);
+        case P_PMGR_ADT_POWER_DISABLE:
+            reply->retval = pmgr_adt_power_disable((const char *)request->args[0]);
+            break;
+        case P_PMGR_RESET:
+            reply->retval = pmgr_reset(request->args[0], (const char *)request->args[1]);
             break;
 
         case P_IODEV_SET_USAGE:
@@ -346,6 +400,13 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval =
                 iodev_write(request->args[0], (void *)request->args[1], request->args[2]);
             break;
+        case P_IODEV_WHOAMI:
+            reply->retval = uartproxy_iodev;
+            break;
+
+        case P_USB_IODEV_VUART_SETUP:
+            usb_iodev_vuart_setup(request->args[0]);
+            break;
 
         case P_TUNABLES_APPLY_GLOBAL:
             reply->retval = tunables_apply_global((const char *)request->args[0],
@@ -361,7 +422,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_DART_INIT:
-            reply->retval = (u64)dart_init(request->args[0], request->args[1]);
+            reply->retval = (u64)dart_init(request->args[0], request->args[1], request->args[2],
+                                           request->args[3]);
             break;
         case P_DART_SHUTDOWN:
             dart_shutdown((dart_dev_t *)request->args[0]);
@@ -374,10 +436,127 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             dart_unmap((dart_dev_t *)request->args[0], request->args[1], request->args[2]);
             break;
 
+        case P_HV_INIT:
+            hv_init();
+            break;
+        case P_HV_MAP:
+            hv_map(request->args[0], request->args[1], request->args[2], request->args[3]);
+            break;
+        case P_HV_START:
+            hv_start((void *)request->args[0], &request->args[1]);
+            break;
+        case P_HV_TRANSLATE:
+            reply->retval = hv_translate(request->args[0], request->args[1], request->args[2],
+                                         (void *)request->args[3]);
+            break;
+        case P_HV_PT_WALK:
+            reply->retval = hv_pt_walk(request->args[0]);
+            break;
+        case P_HV_MAP_VUART:
+            hv_map_vuart(request->args[0], request->args[1], request->args[2]);
+            break;
+        case P_HV_TRACE_IRQ:
+            reply->retval = hv_trace_irq(request->args[0], request->args[1], request->args[2],
+                                         request->args[3]);
+            break;
+        case P_HV_WDT_START:
+            hv_wdt_start(request->args[0]);
+            break;
+        case P_HV_START_SECONDARY:
+            hv_start_secondary(request->args[0], (void *)request->args[1], &request->args[2]);
+            break;
+        case P_HV_SWITCH_CPU:
+            reply->retval = hv_switch_cpu(request->args[0]);
+            break;
+        case P_HV_SET_TIME_STEALING:
+            hv_set_time_stealing(request->args[0], request->args[1]);
+            break;
+        case P_HV_PIN_CPU:
+            hv_pin_cpu(request->args[0]);
+            break;
+        case P_HV_WRITE_HCR:
+            hv_write_hcr(request->args[0]);
+            break;
+
+        case P_FB_INIT:
+            fb_init(request->args[0]);
+            break;
+        case P_FB_SHUTDOWN:
+            fb_shutdown(request->args[0]);
+            break;
+        case P_FB_BLIT:
+            // HACK: Running out of args, stash pix fmt in high bits of stride...
+            fb_blit(request->args[0], request->args[1], request->args[2], request->args[3],
+                    (void *)request->args[4], (u32)request->args[5], request->args[5] >> 32);
+            break;
+        case P_FB_UNBLIT:
+            fb_unblit(request->args[0], request->args[1], request->args[2], request->args[3],
+                      (void *)request->args[4], request->args[5]);
+            break;
+        case P_FB_FILL:
+            fb_fill(request->args[0], request->args[1], request->args[2], request->args[3],
+                    int2rgb(request->args[4]));
+            break;
+        case P_FB_CLEAR:
+            fb_clear(int2rgb(request->args[0]));
+            break;
+        case P_FB_DISPLAY_LOGO:
+            fb_display_logo();
+            break;
+        case P_FB_RESTORE_LOGO:
+            fb_restore_logo();
+            break;
+        case P_FB_IMPROVE_LOGO:
+            fb_improve_logo();
+            break;
+
+        case P_PCIE_INIT:
+            pcie_init();
+            break;
+        case P_PCIE_SHUTDOWN:
+            pcie_shutdown();
+            break;
+
+        case P_NVME_INIT:
+            reply->retval = nvme_init();
+            break;
+        case P_NVME_SHUTDOWN:
+            nvme_shutdown();
+            break;
+        case P_NVME_READ:
+            reply->retval = nvme_read(request->args[0], request->args[1], (void *)request->args[2]);
+            break;
+        case P_NVME_FLUSH:
+            reply->retval = nvme_flush(request->args[0]);
+            break;
+
+        case P_MCC_GET_CARVEOUTS:
+            reply->retval = (u64)mcc_carveouts;
+            break;
+
+        case P_DISPLAY_INIT:
+            reply->retval = display_init();
+            break;
+        case P_DISPLAY_CONFIGURE:
+            reply->retval = display_configure((char *)request->args[0]);
+            break;
+        case P_DISPLAY_SHUTDOWN:
+            display_shutdown(request->args[0]);
+            break;
+
+        case P_DAPF_INIT_ALL:
+            reply->retval = dapf_init_all();
+            break;
+        case P_DAPF_INIT:
+            reply->retval = dapf_init((const char *)request->args[0]);
+            break;
+
         default:
             reply->status = S_BADCMD;
             break;
     }
+    sysop("dsb sy");
+    sysop("isb");
     exc_guard = guard_save;
-    return 1;
+    return 0;
 }

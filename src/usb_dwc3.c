@@ -7,6 +7,8 @@
  * - https://www.beyondlogic.org/usbnutshell/usb1.shtml
  */
 
+#include "../build/build_tag.h"
+
 #include "usb_dwc3.h"
 #include "dart.h"
 #include "malloc.h"
@@ -18,12 +20,10 @@
 #include "usb_types.h"
 #include "utils.h"
 
-#include "../build/build_tag.h"
-
 #define MAX_ENDPOINTS   16
 #define CDC_BUFFER_SIZE SZ_1M
 
-#define usb_debug_printf(fmt, ...) debug_printf("usb-dwc3@%p: " fmt, dev->regs, ##__VA_ARGS__)
+#define usb_debug_printf(fmt, ...) debug_printf("usb-dwc3@%lx: " fmt, dev->regs, ##__VA_ARGS__)
 
 #define STRING_DESCRIPTOR_LANGUAGES    0
 #define STRING_DESCRIPTOR_MANUFACTURER 1
@@ -43,11 +43,13 @@
 
 #define DWC3_SCRATCHPAD_SIZE SZ_16K
 #define TRB_BUFFER_SIZE      SZ_16K
-#define XFER_BUFFER_SIZE     SZ_16K
+#define XFER_BUFFER_SIZE     (SZ_16K * MAX_ENDPOINTS * 2)
 #define PAD_BUFFER_SIZE      SZ_16K
 
 #define TRBS_PER_EP              (TRB_BUFFER_SIZE / (MAX_ENDPOINTS * sizeof(struct dwc3_trb)))
 #define XFER_BUFFER_BYTES_PER_EP (XFER_BUFFER_SIZE / MAX_ENDPOINTS)
+
+#define XFER_SIZE SZ_16K
 
 #define SCRATCHPAD_IOVA   0xbeef0000
 #define EVENT_BUFFER_IOVA 0xdead0000
@@ -64,6 +66,13 @@
 /* these map to physical endpoints 0x02 and 0x82 */
 #define USB_LEP_CDC_BULK_OUT 4
 #define USB_LEP_CDC_BULK_IN  5
+
+/* maps to interrupt endpoint 0x83 */
+#define USB_LEP_CDC_INTR_IN_2 7
+
+/* these map to physical endpoints 0x04 and 0x84 */
+#define USB_LEP_CDC_BULK_OUT_2 8
+#define USB_LEP_CDC_BULK_IN_2  9
 
 /* content doesn't matter at all, this is the setting linux writes by default */
 static const u8 cdc_default_line_coding[] = {0x80, 0x25, 0x00, 0x00, 0x00, 0x00, 0x08};
@@ -100,7 +109,8 @@ typedef struct dwc3_dev {
     struct dwc3_trb *trbs;
 
     struct {
-        u32 xfer_in_progress;
+        bool xfer_in_progress;
+        bool zlp_pending;
 
         void *xfer_buffer;
         uintptr_t xfer_buffer_iova;
@@ -109,13 +119,17 @@ typedef struct dwc3_dev {
         uintptr_t trb_iova;
     } endpoints[MAX_ENDPOINTS];
 
-    /* USB ACM CDC serial */
-    u8 cdc_line_coding[7];
+    struct {
+        ringbuffer_t *host2device;
+        ringbuffer_t *device2host;
+        u8 ep_intr;
+        u8 ep_in;
+        u8 ep_out;
+        bool ready;
+        /* USB ACM CDC serial */
+        u8 cdc_line_coding[7];
+    } pipe[CDC_ACM_PIPE_MAX];
 
-    ringbuffer_t *host2device;
-    ringbuffer_t *device2host;
-
-    bool ready;
 } dwc3_dev_t;
 
 static const struct usb_string_descriptor str_manufacturer =
@@ -138,6 +152,12 @@ struct cdc_dev_desc {
     const struct usb_interface_descriptor interface_data;
     const struct usb_endpoint_descriptor endpoint_data_in;
     const struct usb_endpoint_descriptor endpoint_data_out;
+    const struct usb_interface_descriptor sec_interface_management;
+    const struct cdc_union_functional_descriptor sec_cdc_union_func;
+    const struct usb_endpoint_descriptor sec_endpoint_notification;
+    const struct usb_interface_descriptor sec_interface_data;
+    const struct usb_endpoint_descriptor sec_endpoint_data_in;
+    const struct usb_endpoint_descriptor sec_endpoint_data_out;
 } PACKED;
 
 static const struct usb_device_descriptor usb_cdc_device_descriptor = {
@@ -163,7 +183,7 @@ static const struct cdc_dev_desc cdc_configuration_descriptor = {
             .bLength = sizeof(cdc_configuration_descriptor.configuration),
             .bDescriptorType = USB_CONFIGURATION_DESCRIPTOR,
             .wTotalLength = sizeof(cdc_configuration_descriptor),
-            .bNumInterfaces = 2,
+            .bNumInterfaces = 4,
             .bConfigurationValue = 1,
             .iConfiguration = 0,
             .bmAttributes = USB_CONFIGURATION_ATTRIBUTE_RES1 | USB_CONFIGURATION_SELF_POWERED,
@@ -236,6 +256,77 @@ static const struct cdc_dev_desc cdc_configuration_descriptor = {
             .wMaxPacketSize = 512,
             .bInterval = 10,
         },
+
+    /*
+     * CDC ACM interface for virtual uart
+     */
+
+    .sec_interface_management =
+        {
+            .bLength = sizeof(cdc_configuration_descriptor.sec_interface_management),
+            .bDescriptorType = USB_INTERFACE_DESCRIPTOR,
+            .bInterfaceNumber = 2,
+            .bAlternateSetting = 0,
+            .bNumEndpoints = 1,
+            .bInterfaceClass = CDC_INTERFACE_CLASS,
+            .bInterfaceSubClass = CDC_INTERFACE_SUBCLASS_ACM,
+            .bInterfaceProtocol = CDC_INTERFACE_PROTOCOL_NONE,
+            .iInterface = 0,
+
+        },
+    .sec_cdc_union_func =
+        {
+            .bFunctionLength = sizeof(cdc_configuration_descriptor.sec_cdc_union_func),
+            .bDescriptorType = USB_CDC_INTERFACE_FUNCTIONAL_DESCRIPTOR,
+            .bDescriptorSubtype = USB_CDC_UNION_SUBTYPE,
+            .bControlInterface = 2,
+            .bDataInterface = 3,
+        },
+    /*
+     * we never use this endpoint, but it should exist and always be idle.
+     * it needs to exist in the descriptor though to make hosts correctly recognize
+     * us as a ACM CDC device.
+     */
+    .sec_endpoint_notification =
+        {
+            .bLength = sizeof(cdc_configuration_descriptor.sec_endpoint_notification),
+            .bDescriptorType = USB_ENDPOINT_DESCRIPTOR,
+            .bEndpointAddress = USB_ENDPOINT_ADDR_IN(3),
+            .bmAttributes = USB_ENDPOINT_ATTR_TYPE_INTERRUPT,
+            .wMaxPacketSize = 64,
+            .bInterval = 10,
+
+        },
+    .sec_interface_data =
+        {
+            .bLength = sizeof(cdc_configuration_descriptor.sec_interface_data),
+            .bDescriptorType = USB_INTERFACE_DESCRIPTOR,
+            .bInterfaceNumber = 3,
+            .bAlternateSetting = 0,
+            .bNumEndpoints = 2,
+            .bInterfaceClass = CDC_INTERFACE_CLASS_DATA,
+            .bInterfaceSubClass = 0, // unused
+            .bInterfaceProtocol = 0, // unused
+            .iInterface = 0,
+        },
+    .sec_endpoint_data_in =
+        {
+            .bLength = sizeof(cdc_configuration_descriptor.sec_endpoint_data_in),
+            .bDescriptorType = USB_ENDPOINT_DESCRIPTOR,
+            .bEndpointAddress = USB_ENDPOINT_ADDR_OUT(4),
+            .bmAttributes = USB_ENDPOINT_ATTR_TYPE_BULK,
+            .wMaxPacketSize = 512,
+            .bInterval = 10,
+        },
+    .sec_endpoint_data_out =
+        {
+            .bLength = sizeof(cdc_configuration_descriptor.sec_endpoint_data_out),
+            .bDescriptorType = USB_ENDPOINT_DESCRIPTOR,
+            .bEndpointAddress = USB_ENDPOINT_ADDR_IN(4),
+            .bmAttributes = USB_ENDPOINT_ATTR_TYPE_BULK,
+            .wMaxPacketSize = 512,
+            .bInterval = 10,
+        },
 };
 
 static const struct usb_device_qualifier_descriptor usb_cdc_device_qualifier_descriptor = {
@@ -275,6 +366,11 @@ static const char *ep0_state_names[] = {
     "STATE_DATA_SEND_STATUS",
     "STATE_DATA_SEND_STATUS_DONE",
 };
+
+static u8 ep_to_num(u8 epno)
+{
+    return (epno << 1) | (epno >> 7);
+}
 
 static int usb_dwc3_command(dwc3_dev_t *dev, u32 command, u32 par)
 {
@@ -344,7 +440,7 @@ static int usb_dwc3_ep_start_transfer(dwc3_dev_t *dev, u8 ep, uintptr_t trb_iova
         return ret;
     }
 
-    dev->endpoints[ep].xfer_in_progress = 1;
+    dev->endpoints[ep].xfer_in_progress = true;
     return 0;
 }
 
@@ -508,8 +604,12 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
                     clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT));
                     clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN));
                     clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN));
+                    clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT_2));
+                    clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN_2));
+                    clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN_2));
                     dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
-                    dev->ready = false;
+                    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
+                        dev->pipe[i].ready = false;
                     break;
                 case 1:
                     /* we've already configured these endpoints so that we just need to enable them
@@ -517,6 +617,9 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT));
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN));
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN));
+                    set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT_2));
+                    set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN_2));
+                    set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN_2));
                     dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
                     break;
                 default:
@@ -579,6 +682,23 @@ static void usb_dwc3_ep0_handle_standard_endpoint(dwc3_dev_t *dev,
             dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
             break;
         }
+        case USB_REQUEST_CLEAR_FEATURE: {
+            switch (setup->feature.wFeatureSelector) {
+                case USB_FEATURE_ENDPOINT_HALT:
+                    usb_debug_printf("Host cleared EP 0x%x stall\n", setup->feature.wEndpoint);
+                    usb_dwc3_ep_set_stall(dev, ep_to_num(setup->feature.wEndpoint), 0);
+                    usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN);
+                    dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
+                    break;
+                default:
+                    usb_dwc3_ep_set_stall(dev, 0, 1);
+                    dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
+                    usb_debug_printf("unsupported CLEAR FEATURE: 0x%x\n",
+                                     setup->feature.wFeatureSelector);
+                    break;
+            }
+            break;
+        }
         default:
             usb_dwc3_ep_set_stall(dev, 0, 1);
             dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
@@ -610,28 +730,32 @@ static void usb_dwc3_ep0_handle_standard(dwc3_dev_t *dev, const union usb_setup_
 
 static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_packet *setup)
 {
+    int pipe = setup->raw.wIndex / 2;
+
     switch (setup->raw.bRequest) {
         case USB_REQUEST_CDC_GET_LINE_CODING:
-            dev->ep0_buffer_len = min(setup->raw.wLength, sizeof(dev->cdc_line_coding));
-            dev->ep0_buffer = dev->cdc_line_coding;
+            dev->ep0_buffer_len = min(setup->raw.wLength, sizeof(dev->pipe[pipe].cdc_line_coding));
+            dev->ep0_buffer = dev->pipe[pipe].cdc_line_coding;
             dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
             break;
 
         case USB_REQUEST_CDC_SET_CTRL_LINE_STATE:
             if (setup->raw.wValue & 1) { // DTR
-                dev->ready = false;
+                dev->pipe[pipe].ready = false;
                 usb_debug_printf("ACM device opened\n");
-                dev->ready = true;
+                dev->pipe[pipe].ready = true;
             } else {
-                dev->ready = false;
+                dev->pipe[pipe].ready = false;
                 usb_debug_printf("ACM device closed\n");
             }
-            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
+            usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN);
+            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
             break;
 
         case USB_REQUEST_CDC_SET_LINE_CODING:
-            dev->ep0_read_buffer = dev->cdc_line_coding;
-            dev->ep0_read_buffer_len = min(setup->raw.wLength, sizeof(dev->cdc_line_coding));
+            dev->ep0_read_buffer = dev->pipe[pipe].cdc_line_coding;
+            dev->ep0_read_buffer_len =
+                min(setup->raw.wLength, sizeof(dev->pipe[pipe].cdc_line_coding));
             dev->ep0_state = USB_DWC3_EP0_STATE_DATA_RECV;
             break;
 
@@ -733,6 +857,22 @@ static void usb_dwc3_ep0_handle_xfer_not_ready(dwc3_dev_t *dev,
     }
 }
 
+ringbuffer_t *usb_dwc3_cdc_get_ringbuffer(dwc3_dev_t *dev, u8 endpoint_number)
+{
+    switch (endpoint_number) {
+        case USB_LEP_CDC_BULK_IN:
+            return dev->pipe[CDC_ACM_PIPE_0].device2host;
+        case USB_LEP_CDC_BULK_OUT:
+            return dev->pipe[CDC_ACM_PIPE_0].host2device;
+        case USB_LEP_CDC_BULK_IN_2:
+            return dev->pipe[CDC_ACM_PIPE_1].device2host;
+        case USB_LEP_CDC_BULK_OUT_2:
+            return dev->pipe[CDC_ACM_PIPE_1].host2device;
+        default:
+            return NULL;
+    }
+}
+
 static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number)
 {
     struct dwc3_trb *trb;
@@ -741,16 +881,20 @@ static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number
     if (dev->endpoints[endpoint_number].xfer_in_progress)
         return;
 
-    if (ringbuffer_get_free(dev->host2device) < 512)
+    ringbuffer_t *host2device = usb_dwc3_cdc_get_ringbuffer(dev, endpoint_number);
+    if (!host2device)
         return;
 
-    memset(dev->endpoints[endpoint_number].xfer_buffer, 0xaa, 512);
+    if (ringbuffer_get_free(host2device) < XFER_SIZE)
+        return;
+
+    memset(dev->endpoints[endpoint_number].xfer_buffer, 0xaa, XFER_SIZE);
     trb_iova = usb_dwc3_init_trb(dev, endpoint_number, &trb);
     trb->ctrl |= DWC3_TRBCTL_NORMAL;
-    trb->size = DWC3_TRB_SIZE_LENGTH(512);
+    trb->size = DWC3_TRB_SIZE_LENGTH(XFER_SIZE);
 
     usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova);
-    dev->endpoints[endpoint_number].xfer_in_progress = 1;
+    dev->endpoints[endpoint_number].xfer_in_progress = true;
 }
 
 static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
@@ -761,10 +905,14 @@ static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
     if (dev->endpoints[endpoint_number].xfer_in_progress)
         return;
 
-    size_t len =
-        ringbuffer_read(dev->endpoints[endpoint_number].xfer_buffer, 512, dev->device2host);
+    ringbuffer_t *device2host = usb_dwc3_cdc_get_ringbuffer(dev, endpoint_number);
+    if (!device2host)
+        return;
 
-    if (!len)
+    size_t len =
+        ringbuffer_read(dev->endpoints[endpoint_number].xfer_buffer, XFER_SIZE, device2host);
+
+    if (!len && !dev->endpoints[endpoint_number].zlp_pending)
         return;
 
     trb_iova = usb_dwc3_init_trb(dev, endpoint_number, &trb);
@@ -772,31 +920,38 @@ static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
     trb->size = DWC3_TRB_SIZE_LENGTH(len);
 
     usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova);
-    dev->endpoints[endpoint_number].xfer_in_progress = 1;
+    dev->endpoints[endpoint_number].xfer_in_progress = true;
+    dev->endpoints[endpoint_number].zlp_pending = (len % 512) == 0;
 }
 
 static void usb_dwc3_cdc_handle_bulk_out_xfer_done(dwc3_dev_t *dev,
                                                    const struct dwc3_event_depevt event)
 {
-    size_t len = min(512, ringbuffer_get_free(dev->host2device));
+    ringbuffer_t *host2device = usb_dwc3_cdc_get_ringbuffer(dev, event.endpoint_number);
+    if (!host2device)
+        return;
+    size_t len = min(XFER_SIZE, ringbuffer_get_free(host2device));
     ringbuffer_write(dev->endpoints[event.endpoint_number].xfer_buffer,
-                     len - dev->endpoints[event.endpoint_number].trb->size, dev->host2device);
+                     len - dev->endpoints[event.endpoint_number].trb->size, host2device);
 }
 
 static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_depevt event)
 {
     if (event.endpoint_event == DWC3_DEPEVT_XFERCOMPLETE) {
-        dev->endpoints[event.endpoint_number].xfer_in_progress = 0;
+        dev->endpoints[event.endpoint_number].xfer_in_progress = false;
 
         switch (event.endpoint_number) {
             case USB_LEP_CTRL_IN:
             case USB_LEP_CTRL_OUT:
                 return usb_dwc3_ep0_handle_xfer_done(dev, event);
-            case USB_LEP_CDC_INTR_IN:
+            case USB_LEP_CDC_INTR_IN: // [[fallthrough]]
+            case USB_LEP_CDC_INTR_IN_2:
                 return;
-            case USB_LEP_CDC_BULK_IN:
+            case USB_LEP_CDC_BULK_IN: // [[fallthrough]]
+            case USB_LEP_CDC_BULK_IN_2:
                 return;
-            case USB_LEP_CDC_BULK_OUT:
+            case USB_LEP_CDC_BULK_OUT: // [[fallthrough]]
+            case USB_LEP_CDC_BULK_OUT_2:
                 return usb_dwc3_cdc_handle_bulk_out_xfer_done(dev, event);
         }
     } else if (event.endpoint_event == DWC3_DEPEVT_XFERNOTREADY) {
@@ -811,11 +966,14 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
             case USB_LEP_CTRL_IN:
             case USB_LEP_CTRL_OUT:
                 return usb_dwc3_ep0_handle_xfer_not_ready(dev, event);
-            case USB_LEP_CDC_INTR_IN:
+            case USB_LEP_CDC_INTR_IN: // [[fallthrough]]
+            case USB_LEP_CDC_INTR_IN_2:
                 return;
-            case USB_LEP_CDC_BULK_IN:
+            case USB_LEP_CDC_BULK_IN: // [[fallthrough]]
+            case USB_LEP_CDC_BULK_IN_2:
                 return usb_dwc3_cdc_start_bulk_in_xfer(dev, event.endpoint_number);
-            case USB_LEP_CDC_BULK_OUT:
+            case USB_LEP_CDC_BULK_OUT: // [[fallthrough]]
+            case USB_LEP_CDC_BULK_OUT_2:
                 return usb_dwc3_cdc_start_bulk_out_xfer(dev, event.endpoint_number);
         }
     }
@@ -829,9 +987,9 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
 static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev)
 {
     /* clear STALL mode for all endpoints */
-    dev->endpoints[0].xfer_in_progress = 0;
+    dev->endpoints[0].xfer_in_progress = false;
     for (int i = 1; i < MAX_ENDPOINTS; ++i) {
-        dev->endpoints[i].xfer_in_progress = 0;
+        dev->endpoints[i].xfer_in_progress = false;
         memset(dev->endpoints[i].xfer_buffer, 0, XFER_BUFFER_BYTES_PER_EP);
         memset(dev->endpoints[i].trb, 0, TRBS_PER_EP * sizeof(struct dwc3_trb));
         usb_dwc3_ep_set_stall(dev, i, 0);
@@ -886,6 +1044,9 @@ static void usb_dwc3_handle_event(dwc3_dev_t *dev, const union dwc3_event event)
 
 void usb_dwc3_handle_events(dwc3_dev_t *dev)
 {
+    if (!dev)
+        return;
+
     u32 n_events = read32(dev->regs + DWC3_GEVNTCOUNT(0)) / sizeof(union dwc3_event);
     if (n_events == 0)
         return;
@@ -908,7 +1069,7 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     /* sanity check */
     u32 snpsid = read32(regs + DWC3_GSNPSID);
     if ((snpsid & DWC3_GSNPSID_MASK) != 0x33310000) {
-        debug_printf("no DWC3 core found at %p: %08x\n", regs, snpsid);
+        debug_printf("no DWC3 core found at 0x%lx: %08x\n", regs, snpsid);
         return NULL;
     }
 
@@ -917,16 +1078,12 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
         return NULL;
 
     memset(dev, 0, sizeof(*dev));
-    memcpy(dev->cdc_line_coding, cdc_default_line_coding, sizeof(cdc_default_line_coding));
+    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
+        memcpy(dev->pipe[i].cdc_line_coding, cdc_default_line_coding,
+               sizeof(cdc_default_line_coding));
+
     dev->regs = regs;
     dev->dart = dart;
-
-    dev->host2device = ringbuffer_alloc(CDC_BUFFER_SIZE);
-    if (!dev->host2device)
-        goto error;
-    dev->device2host = ringbuffer_alloc(CDC_BUFFER_SIZE);
-    if (!dev->device2host)
-        goto error;
 
     /* allocate and map dma buffers */
     dev->evtbuffer = memalign(SZ_16K, max(DWC3_EVENT_BUFFERS_SIZE, SZ_16K));
@@ -1030,15 +1187,34 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     if (usb_dwc3_ep_configure(dev, USB_LEP_CTRL_IN, DWC3_DEPCMD_TYPE_CONTROL, 64))
         goto error;
 
-    /* prepare INTR endpoint so that we don't have to reconfigure this device later */
-    if (usb_dwc3_ep_configure(dev, USB_LEP_CDC_INTR_IN, DWC3_DEPCMD_TYPE_INTR, 64))
-        goto error;
+    /* prepare CDC ACM interfaces */
 
-    /* prepare BULK endpoints so that we don't have to reconfigure this device later */
-    if (usb_dwc3_ep_configure(dev, USB_LEP_CDC_BULK_OUT, DWC3_DEPCMD_TYPE_BULK, 512))
-        goto error;
-    if (usb_dwc3_ep_configure(dev, USB_LEP_CDC_BULK_IN, DWC3_DEPCMD_TYPE_BULK, 512))
-        goto error;
+    dev->pipe[CDC_ACM_PIPE_0].ep_intr = USB_LEP_CDC_INTR_IN;
+    dev->pipe[CDC_ACM_PIPE_0].ep_in = USB_LEP_CDC_BULK_IN;
+    dev->pipe[CDC_ACM_PIPE_0].ep_out = USB_LEP_CDC_BULK_OUT;
+
+    dev->pipe[CDC_ACM_PIPE_1].ep_intr = USB_LEP_CDC_INTR_IN_2;
+    dev->pipe[CDC_ACM_PIPE_1].ep_in = USB_LEP_CDC_BULK_IN_2;
+    dev->pipe[CDC_ACM_PIPE_1].ep_out = USB_LEP_CDC_BULK_OUT_2;
+
+    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
+        dev->pipe[i].host2device = ringbuffer_alloc(CDC_BUFFER_SIZE);
+        if (!dev->pipe[i].host2device)
+            goto error;
+        dev->pipe[i].device2host = ringbuffer_alloc(CDC_BUFFER_SIZE);
+        if (!dev->pipe[i].device2host)
+            goto error;
+
+        /* prepare INTR endpoint so that we don't have to reconfigure this device later */
+        if (usb_dwc3_ep_configure(dev, dev->pipe[i].ep_intr, DWC3_DEPCMD_TYPE_INTR, 64))
+            goto error;
+
+        /* prepare BULK endpoints so that we don't have to reconfigure this device later */
+        if (usb_dwc3_ep_configure(dev, dev->pipe[i].ep_in, DWC3_DEPCMD_TYPE_BULK, 512))
+            goto error;
+        if (usb_dwc3_ep_configure(dev, dev->pipe[i].ep_out, DWC3_DEPCMD_TYPE_BULK, 512))
+            goto error;
+    }
 
     /* prepare first control transfer */
     dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
@@ -1059,7 +1235,8 @@ error:
 
 void usb_dwc3_shutdown(dwc3_dev_t *dev)
 {
-    dev->ready = false;
+    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
+        dev->pipe[i].ready = false;
 
     /* stop all ongoing transfers */
     for (int i = 1; i < MAX_ENDPOINTS; ++i) {
@@ -1094,81 +1271,146 @@ void usb_dwc3_shutdown(dwc3_dev_t *dev)
     free(dev->scratchpad);
     free(dev->xferbuffer);
     free(dev->trbs);
-    ringbuffer_free(dev->host2device);
-    ringbuffer_free(dev->device2host);
+    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
+        ringbuffer_free(dev->pipe[i].device2host);
+        ringbuffer_free(dev->pipe[i].host2device);
+    }
+
+    if (dev->dart)
+        dart_shutdown(dev->dart);
     free(dev);
 }
 
-u8 usb_dwc3_getbyte(dwc3_dev_t *dev)
+u8 usb_dwc3_getbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
 {
+    ringbuffer_t *host2device = dev->pipe[pipe].host2device;
+    if (!host2device)
+        return 0;
+
+    u8 ep = dev->pipe[pipe].ep_out;
+
     u8 c;
-    while (ringbuffer_read(&c, 1, dev->host2device) < 1) {
+    while (ringbuffer_read(&c, 1, host2device) < 1) {
         usb_dwc3_handle_events(dev);
-        usb_dwc3_cdc_start_bulk_out_xfer(dev, USB_LEP_CDC_BULK_OUT);
+        usb_dwc3_cdc_start_bulk_out_xfer(dev, ep);
     }
     return c;
 }
 
-void usb_dwc3_putbyte(dwc3_dev_t *dev, u8 byte)
+void usb_dwc3_putbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, u8 byte)
 {
-    while (ringbuffer_write(&byte, 1, dev->device2host) < 1) {
+    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
+    if (!device2host)
+        return;
+
+    u8 ep = dev->pipe[pipe].ep_in;
+
+    while (ringbuffer_write(&byte, 1, device2host) < 1) {
         usb_dwc3_handle_events(dev);
-        usb_dwc3_cdc_start_bulk_in_xfer(dev, USB_LEP_CDC_BULK_IN);
+        usb_dwc3_cdc_start_bulk_in_xfer(dev, ep);
     }
 }
 
-size_t usb_dwc3_write(dwc3_dev_t *dev, const void *buf, size_t count)
+size_t usb_dwc3_queue(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
 {
     const u8 *p = buf;
     size_t wrote, sent = 0;
 
-    if (!dev || !dev->ready)
+    if (!dev || !dev->pipe[pipe].ready)
         return 0;
 
+    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
+    if (!device2host)
+        return 0;
+
+    u8 ep = dev->pipe[pipe].ep_in;
+
     while (count) {
-        wrote = ringbuffer_write(p, count, dev->device2host);
+        wrote = ringbuffer_write(p, count, device2host);
         count -= wrote;
         p += wrote;
         sent += wrote;
-        usb_dwc3_handle_events(dev);
-        usb_dwc3_cdc_start_bulk_in_xfer(dev, USB_LEP_CDC_BULK_IN);
+        if (count) {
+            usb_dwc3_handle_events(dev);
+            usb_dwc3_cdc_start_bulk_in_xfer(dev, ep);
+        }
     }
 
     return sent;
 }
 
-size_t usb_dwc3_read(dwc3_dev_t *dev, void *buf, size_t count)
+size_t usb_dwc3_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
+{
+    if (!dev)
+        return -1;
+
+    u8 ep = dev->pipe[pipe].ep_in;
+    size_t ret = usb_dwc3_queue(dev, pipe, buf, count);
+
+    usb_dwc3_cdc_start_bulk_in_xfer(dev, ep);
+
+    return ret;
+}
+
+size_t usb_dwc3_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t count)
 {
     u8 *p = buf;
     size_t read, recvd = 0;
 
-    if (!dev || !dev->ready)
+    if (!dev || !dev->pipe[pipe].ready)
         return 0;
 
+    ringbuffer_t *host2device = dev->pipe[pipe].host2device;
+    if (!host2device)
+        return 0;
+
+    u8 ep = dev->pipe[pipe].ep_out;
+
     while (count) {
-        read = ringbuffer_read(p, count, dev->host2device);
+        read = ringbuffer_read(p, count, host2device);
         count -= read;
         p += read;
         recvd += read;
         usb_dwc3_handle_events(dev);
-        usb_dwc3_cdc_start_bulk_out_xfer(dev, USB_LEP_CDC_BULK_OUT);
+        usb_dwc3_cdc_start_bulk_out_xfer(dev, ep);
     }
 
     return recvd;
 }
 
-bool usb_dwc3_can_read(dwc3_dev_t *dev)
+ssize_t usb_dwc3_can_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
 {
-    if (!dev || !dev->ready)
-        return false;
+    if (!dev || !dev->pipe[pipe].ready)
+        return 0;
 
-    return ringbuffer_get_used(dev->host2device);
+    ringbuffer_t *host2device = dev->pipe[pipe].host2device;
+    if (!host2device)
+        return 0;
+
+    return ringbuffer_get_used(host2device);
 }
 
-bool usb_dwc3_can_write(dwc3_dev_t *dev)
+bool usb_dwc3_can_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
 {
+    (void)pipe;
     if (!dev)
         return false;
 
-    return dev->ready;
+    return dev->pipe[pipe].ready;
+}
+
+void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
+{
+    if (!dev || !dev->pipe[pipe].ready)
+        return;
+
+    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
+    if (!device2host)
+        return;
+
+    u8 ep = dev->pipe[pipe].ep_in;
+
+    while (ringbuffer_get_used(device2host) != 0 || dev->endpoints[ep].xfer_in_progress) {
+        usb_dwc3_handle_events(dev);
+    }
 }

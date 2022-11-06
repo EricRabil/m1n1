@@ -5,12 +5,30 @@
 
 #include "types.h"
 
-#define printf debug_printf
+#define printf(...) debug_printf(__VA_ARGS__)
 
-#define BIT(x) (1L << (x))
+#ifdef DEBUG
+#define dprintf(...) debug_printf(__VA_ARGS__)
+#else
+#define dprintf(...)                                                                               \
+    do {                                                                                           \
+    } while (0)
+#endif
+
+#define BIT(x)                 (1UL << (x))
+#define MASK(x)                (BIT(x) - 1)
+#define GENMASK(msb, lsb)      ((BIT((msb + 1) - (lsb)) - 1) << (lsb))
+#define _FIELD_LSB(field)      ((field) & ~(field - 1))
+#define FIELD_PREP(field, val) ((val) * (_FIELD_LSB(field)))
+#define FIELD_GET(field, val)  (((val) & (field)) / _FIELD_LSB(field))
+
+#define ALIGN_UP(x, a)   (((x) + ((a)-1)) & ~((a)-1))
+#define ALIGN_DOWN(x, a) ((x) & ~((a)-1))
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #define max(a, b) (((a) > (b)) ? (a) : (b))
+
+#define USEC_PER_SEC 1000000L
 
 static inline u64 read64(u64 addr)
 {
@@ -234,26 +252,62 @@ static inline u8 writeread8(u64 addr, u8 data)
     return read8(addr);
 }
 
-#define sys_reg(op0, op1, CRn, CRm, op2) s##op0##_##op1##_c##CRn##_c##CRm##_##op2
+static inline void write64_lo_hi(u64 addr, u64 val)
+{
+    write32(addr, val);
+    write32(addr + 4, val >> 32);
+}
 
-#define _mrs(reg)                                                                                  \
+#define _concat(a, _1, b, ...) a##b
+
+#define _sr_tkn_S(_0, _1, op0, op1, CRn, CRm, op2) s##op0##_##op1##_c##CRn##_c##CRm##_##op2
+
+#define _sr_tkn(a) a
+
+#define sr_tkn(...) _concat(_sr_tkn, __VA_ARGS__, )(__VA_ARGS__)
+
+#define __mrs(reg)                                                                                 \
     ({                                                                                             \
         u64 val;                                                                                   \
         __asm__ volatile("mrs\t%0, " #reg : "=r"(val));                                            \
         val;                                                                                       \
     })
-#define mrs(reg) _mrs(reg)
+#define _mrs(reg) __mrs(reg)
 
-#define _msr(reg, val)                                                                             \
+#define __msr(reg, val)                                                                            \
     ({                                                                                             \
         u64 __val = (u64)val;                                                                      \
         __asm__ volatile("msr\t" #reg ", %0" : : "r"(__val));                                      \
     })
-#define msr(reg, val) _msr(reg, val)
+#define _msr(reg, val) __msr(reg, val)
 
-#define reg_clr(reg, bits)      msr(reg, mrs(reg) & ~(bits))
-#define reg_set(reg, bits)      msr(reg, mrs(reg) | bits)
-#define reg_mask(reg, clr, set) msr(reg, (mrs(reg) & ~(clr)) | set)
+#define mrs(reg)      _mrs(sr_tkn(reg))
+#define msr(reg, val) _msr(sr_tkn(reg), val)
+#define msr_sync(reg, val)                                                                         \
+    ({                                                                                             \
+        _msr(sr_tkn(reg), val);                                                                    \
+        sysop("isb");                                                                              \
+    })
+
+#define reg_clr(reg, bits)      _msr(sr_tkn(reg), _mrs(sr_tkn(reg)) & ~(bits))
+#define reg_set(reg, bits)      _msr(sr_tkn(reg), _mrs(sr_tkn(reg)) | bits)
+#define reg_mask(reg, clr, set) _msr(sr_tkn(reg), (_mrs(sr_tkn(reg)) & ~(clr)) | set)
+
+#define reg_clr_sync(reg, bits)                                                                    \
+    ({                                                                                             \
+        reg_clr(sr_tkn(reg), bits);                                                                \
+        sysop("isb");                                                                              \
+    })
+#define reg_set_sync(reg, bits)                                                                    \
+    ({                                                                                             \
+        reg_set(sr_tkn(reg), bits);                                                                \
+        sysop("isb");                                                                              \
+    })
+#define reg_mask_sync(reg, clr, set)                                                               \
+    ({                                                                                             \
+        reg_mask(sr_tkn(reg), clr, set);                                                           \
+        sysop("isb");                                                                              \
+    })
 
 #define sysop(op) __asm__ volatile(op ::: "memory")
 
@@ -291,6 +345,7 @@ static inline int is_primary_core(void)
 }
 
 extern char _base[];
+extern char _rodata_end[];
 extern char _end[];
 extern char _payload_start[];
 extern char _payload_end[];
@@ -299,6 +354,7 @@ extern char _payload_end[];
  * These functions are guaranteed to copy by reading from src and writing to dst
  * in <n>-bit units If size is not aligned, the remaining bytes are not copied
  */
+void memcpy128(void *dst, void *src, size_t size);
 void memset64(void *dst, u64 value, size_t size);
 void memcpy64(void *dst, void *src, size_t size);
 void memset32(void *dst, u32 value, size_t size);
@@ -308,19 +364,51 @@ void memcpy16(void *dst, void *src, size_t size);
 void memset8(void *dst, u8 value, size_t size);
 void memcpy8(void *dst, void *src, size_t size);
 
+void get_simd_state(void *state);
+void put_simd_state(void *state);
+
 void hexdump(const void *d, size_t len);
 void regdump(u64 addr, size_t len);
-int sprintf(char *str, const char *fmt, ...);
-int debug_printf(const char *fmt, ...);
+int snprintf(char *str, size_t size, const char *fmt, ...);
+int debug_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void udelay(u32 d);
+
+static inline u64 get_ticks(void)
+{
+    return mrs(CNTPCT_EL0);
+}
+u64 ticks_to_msecs(u64 ticks);
+u64 ticks_to_usecs(u64 ticks);
+
 void reboot(void) __attribute__((noreturn));
+void flush_and_reboot(void) __attribute__((noreturn));
+
+u64 timeout_calculate(u32 usec);
+bool timeout_expired(u64 timeout);
+
+#define SPINLOCK_ALIGN 64
+
+typedef struct {
+    s64 lock;
+    int count;
+} spinlock_t ALIGNED(SPINLOCK_ALIGN);
+
+#define SPINLOCK_INIT                                                                              \
+    {                                                                                              \
+        -1, 0                                                                                      \
+    }
+#define DECLARE_SPINLOCK(n) spinlock_t n = SPINLOCK_INIT;
+
+void spin_init(spinlock_t *lock);
+void spin_lock(spinlock_t *lock);
+void spin_unlock(spinlock_t *lock);
 
 #define mdelay(m) udelay((m)*1000)
 
 #define panic(fmt, ...)                                                                            \
     do {                                                                                           \
         debug_printf(fmt, ##__VA_ARGS__);                                                          \
-        reboot();                                                                                  \
+        flush_and_reboot();                                                                        \
     } while (0)
 
 static inline int poll32(u64 addr, u32 mask, u32 target, u32 timeout)
@@ -335,13 +423,20 @@ static inline int poll32(u64 addr, u32 mask, u32 target, u32 timeout)
     return -1;
 }
 
-typedef u64(generic_func)(u64, u64, u64, u64);
+typedef u64(generic_func)(u64, u64, u64, u64, u64);
 
 struct vector_args {
     generic_func *entry;
-    u64 args[4];
+    u64 args[5];
+    bool restore_logo;
 };
 
+extern u32 board_id, chip_id;
+
 extern struct vector_args next_stage;
+
+void deep_wfi(void);
+
+bool is_heap(void *addr);
 
 #endif

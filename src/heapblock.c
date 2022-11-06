@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
-#include "assert.h"
 #include "heapblock.h"
+#include "assert.h"
 #include "types.h"
 #include "utils.h"
 #include "xnuboot.h"
@@ -20,13 +20,8 @@ static void *heap_base;
 void heapblock_init(void)
 {
     void *top_of_kernel_data = (void *)cur_boot_args.top_of_kernel_data;
-    void *payload_end = _payload_end;
 
-    if (payload_end > top_of_kernel_data)
-        heap_base = payload_end; // Chainloaded, we are last in RAM
-    else
-        heap_base = top_of_kernel_data; // Loaded by iBoot, there is data after us in RAM
-
+    heap_base = top_of_kernel_data;
     heapblock_alloc(0); // align base
 
     printf("Heap base: %p\n", heap_base);
@@ -40,6 +35,7 @@ void *heapblock_alloc(size_t size)
 void *heapblock_alloc_aligned(size_t size, size_t align)
 {
     assert((align & (align - 1)) == 0);
+    assert(heap_base);
 
     uintptr_t block = (((uintptr_t)heap_base) + align - 1) & ~(align - 1);
     heap_base = (void *)(block + size);

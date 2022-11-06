@@ -2,13 +2,20 @@
 
 #include "smp.h"
 #include "adt.h"
+#include "cpu_regs.h"
+#include "malloc.h"
+#include "pmgr.h"
+#include "soc.h"
 #include "string.h"
 #include "types.h"
 #include "utils.h"
 
-#define CPU_START_OFF 0x54000
+#define CPU_START_OFF_T8103 0x54000
+#define CPU_START_OFF_T8112 0x34000
 
-#define SECONDARY_STACK_SIZE 0x4000
+#define CPU_REG_CORE    GENMASK(7, 0)
+#define CPU_REG_CLUSTER GENMASK(10, 8)
+#define CPU_REG_DIE     GENMASK(14, 11)
 
 struct spin_table {
     u64 mpidr;
@@ -20,7 +27,12 @@ struct spin_table {
 
 void *_reset_stack;
 
-static u8 secondary_stacks[MAX_CPUS][SECONDARY_STACK_SIZE] ALIGNED(64);
+#define DUMMY_STACK_SIZE 0x1000
+u8 dummy_stack[DUMMY_STACK_SIZE];
+
+u8 *secondary_stacks[MAX_CPUS] = {dummy_stack};
+
+static bool wfe_mode = false;
 
 static int target_cpu;
 static struct spin_table spin_table[MAX_CPUS];
@@ -30,6 +42,12 @@ extern u8 _vectors_start[0];
 void smp_secondary_entry(void)
 {
     struct spin_table *me = &spin_table[target_cpu];
+
+    if (in_el2())
+        msr(TPIDR_EL2, target_cpu);
+    else
+        msr(TPIDR_EL1, target_cpu);
+
     printf("  Index: %d (table: %p)\n\n", target_cpu, me);
 
     me->mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
@@ -38,9 +56,16 @@ void smp_secondary_entry(void)
     me->flag = 1;
     sysop("dmb sy");
     u64 target;
+
     while (1) {
         while (!(target = me->target)) {
-            sysop("wfe");
+            if (wfe_mode) {
+                sysop("wfe");
+            } else {
+                deep_wfi();
+                msr(SYS_IMP_APL_IPI_SR_EL1, 1);
+            }
+            sysop("isb");
         }
         sysop("dmb sy");
         me->flag++;
@@ -53,34 +78,36 @@ void smp_secondary_entry(void)
     }
 }
 
-static void smp_start_cpu(int index, int cluster, int core, u64 rvbar, u64 cpu_start_base)
+static void smp_start_cpu(int index, int die, int cluster, int core, u64 rvbar, u64 cpu_start_base)
 {
     int i;
+
+    if (index >= MAX_CPUS)
+        return;
 
     if (spin_table[index].flag)
         return;
 
-    printf("Starting CPU %d (%d:%d)... ", index, cluster, core);
+    printf("Starting CPU %d (%d:%d:%d)... ", index, die, cluster, core);
 
     memset(&spin_table[index], 0, sizeof(struct spin_table));
 
     target_cpu = index;
+    secondary_stacks[index] = memalign(0x4000, SECONDARY_STACK_SIZE);
     _reset_stack = secondary_stacks[index] + SECONDARY_STACK_SIZE;
 
     sysop("dmb sy");
 
     write64(rvbar, (u64)_vectors_start);
 
+    cpu_start_base += die * PMGR_DIE_OFFSET;
+
     // Some kind of system level startup/status bit
     // Without this, IRQs don't work
-    write32(cpu_start_base + 0x4, 1 << index);
+    write32(cpu_start_base + 0x4, 1 << (4 * cluster + core));
 
     // Actually start the core
-    if (cluster == 0) {
-        write32(cpu_start_base + 0x8, 1 << core);
-    } else {
-        write32(cpu_start_base + 0xc, 1 << core);
-    }
+    write32(cpu_start_base + 0x8 + 4 * cluster, 1 << core);
 
     for (i = 0; i < 500; i++) {
         sysop("dmb ld");
@@ -93,6 +120,8 @@ static void smp_start_cpu(int index, int cluster, int core, u64 rvbar, u64 cpu_s
         printf("Failed!\n");
     else
         printf("  Started.\n");
+
+    _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
 }
 
 void smp_start_secondaries(void)
@@ -118,8 +147,24 @@ void smp_start_secondaries(void)
     }
 
     int cpu_nodes[MAX_CPUS];
+    u64 cpu_start_off;
 
     memset(cpu_nodes, 0, sizeof(cpu_nodes));
+
+    switch (chip_id) {
+        case T8103:
+        case T6000:
+        case T6001:
+        case T6002:
+            cpu_start_off = CPU_START_OFF_T8103;
+            break;
+        case T8112:
+            cpu_start_off = CPU_START_OFF_T8112;
+            break;
+        default:
+            printf("CPU start offset is unknown for this SoC!\n");
+            return;
+    }
 
     ADT_FOREACH_CHILD(adt, node)
     {
@@ -139,7 +184,7 @@ void smp_start_secondaries(void)
         int node = cpu_nodes[i];
 
         if (!node)
-            break;
+            continue;
 
         u32 reg;
         u64 cpu_impl_reg[2];
@@ -148,14 +193,30 @@ void smp_start_secondaries(void)
         if (ADT_GETPROP_ARRAY(adt, node, "cpu-impl-reg", cpu_impl_reg) < 0)
             continue;
 
-        smp_start_cpu(i, reg >> 8, reg & 0xff, cpu_impl_reg[0], pmgr_reg + CPU_START_OFF);
+        u8 core = FIELD_GET(CPU_REG_CORE, reg);
+        u8 cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
+        u8 die = FIELD_GET(CPU_REG_DIE, reg);
+
+        smp_start_cpu(i, die, cluster, core, cpu_impl_reg[0], pmgr_reg + cpu_start_off);
     }
 
     spin_table[0].mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
 }
 
+void smp_send_ipi(int cpu)
+{
+    if (cpu >= MAX_CPUS)
+        return;
+
+    u64 mpidr = spin_table[cpu].mpidr;
+    msr(SYS_IMP_APL_IPI_RR_GLOBAL_EL1, (mpidr & 0xff) | ((mpidr & 0xff00) << 8));
+}
+
 void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 {
+    if (cpu >= MAX_CPUS)
+        return;
+
     struct spin_table *target = &spin_table[cpu];
 
     if (cpu == 0)
@@ -168,14 +229,22 @@ void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
     target->args[3] = arg3;
     sysop("dmb sy");
     target->target = (u64)func;
-    sysop("dmb sy");
-    sysop("sev");
+    sysop("dsb sy");
+
+    if (wfe_mode)
+        sysop("sev");
+    else
+        smp_send_ipi(cpu);
+
     while (target->flag == flag)
         sysop("dmb sy");
 }
 
 u64 smp_wait(int cpu)
 {
+    if (cpu >= MAX_CPUS)
+        return 0;
+
     struct spin_table *target = &spin_table[cpu];
 
     while (target->target)
@@ -184,14 +253,40 @@ u64 smp_wait(int cpu)
     return target->retval;
 }
 
-int smp_get_mpidr(int cpu)
+void smp_set_wfe_mode(bool new_mode)
 {
+    wfe_mode = new_mode;
+    sysop("dsb sy");
+
+    for (int cpu = 1; cpu < MAX_CPUS; cpu++)
+        if (smp_is_alive(cpu))
+            smp_send_ipi(cpu);
+
+    sysop("sev");
+}
+
+bool smp_is_alive(int cpu)
+{
+    if (cpu >= MAX_CPUS)
+        return false;
+
+    return spin_table[cpu].flag;
+}
+
+uint64_t smp_get_mpidr(int cpu)
+{
+    if (cpu >= MAX_CPUS)
+        return 0;
+
     return spin_table[cpu].mpidr;
 }
 
 u64 smp_get_release_addr(int cpu)
 {
     struct spin_table *target = &spin_table[cpu];
+
+    if (cpu >= MAX_CPUS)
+        return 0;
 
     target->args[0] = 0;
     target->args[1] = 0;

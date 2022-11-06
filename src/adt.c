@@ -129,6 +129,20 @@ const void *adt_getprop(const void *adt, int nodeoffset, const char *name, u32 *
     return adt_getprop_namelen(adt, nodeoffset, name, strlen(name), lenp);
 }
 
+int adt_setprop(void *adt, int nodeoffset, const char *name, void *value, size_t len)
+{
+    u32 plen;
+    void *prop = (void *)adt_getprop(adt, nodeoffset, name, &plen);
+    if (!prop)
+        return -ADT_ERR_NOTFOUND;
+
+    if (len != plen)
+        return -ADT_ERR_BADLENGTH;
+
+    memcpy(prop, value, len);
+    return len;
+}
+
 int adt_getprop_copy(const void *adt, int nodeoffset, const char *name, void *out, size_t len)
 {
     u32 plen;
@@ -340,4 +354,22 @@ int adt_get_reg(const void *adt, int *path, const char *prop, int idx, u64 *padd
         *psize = size;
 
     return 0;
+}
+
+bool adt_is_compatible(const void *adt, int nodeoffset, const char *compat)
+{
+    u32 len;
+    const char *list = adt_getprop(adt, nodeoffset, "compatible", &len);
+    if (!list)
+        return false;
+
+    const char *end = list + len;
+
+    while (list != end) {
+        if (!strcmp(list, compat))
+            return true;
+        list += strlen(list) + 1;
+    }
+
+    return false;
 }

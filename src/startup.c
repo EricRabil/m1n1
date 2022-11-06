@@ -56,39 +56,48 @@ void dump_boot_args(struct boot_args *ba)
     printf("    base:       0x%lx\n", ba->video.base);
     printf("    display:    0x%lx\n", ba->video.display);
     printf("    stride:     0x%lx\n", ba->video.stride);
-    printf("    width:      %d\n", ba->video.width);
-    printf("    height:     %d\n", ba->video.height);
-    printf("    depth:      0x%lx\n", ba->video.depth);
+    printf("    width:      %lu\n", ba->video.width);
+    printf("    height:     %lu\n", ba->video.height);
+    printf("    depth:      %lubpp\n", ba->video.depth & 0xff);
+    printf("    density:    %lu\n", ba->video.depth >> 16);
     printf("  machine_type: %d\n", ba->machine_type);
     printf("  devtree:      %p\n", ba->devtree);
     printf("  devtree_size: 0x%x\n", ba->devtree_size);
     printf("  cmdline:      %s\n", ba->cmdline);
-    printf("  boot_flags:   0x%x\n", ba->boot_flags);
+    printf("  boot_flags:   0x%lx\n", ba->boot_flags);
     printf("  mem_size_act: 0x%lx\n", ba->mem_size_actual);
 }
 
 void _start_c(void *boot_args, void *base)
 {
     UNUSED(base);
+
+    if (in_el2())
+        msr(TPIDR_EL2, 0);
+    else
+        msr(TPIDR_EL1, 0);
+
     memset64(_bss_start, 0, _bss_end - _bss_start);
-    uart_putchar('s');
-    uart_init();
-    uart_putchar('c');
-    uart_puts(": Initializing");
-    printf("CPU init... ");
-    const char *type = init_cpu();
-    printf("CPU: %s\n\n", type);
-
-    printf("boot_args at %p\n", boot_args);
-
     boot_args_addr = (u64)boot_args;
     memcpy(&cur_boot_args, boot_args, sizeof(cur_boot_args));
 
-    dump_boot_args(&cur_boot_args);
-    printf("\n");
-
     adt =
         (void *)(((u64)cur_boot_args.devtree) - cur_boot_args.virt_base + cur_boot_args.phys_base);
+
+    int ret = uart_init();
+    if (ret < 0) {
+        debug_putc('!');
+    }
+
+    uart_puts("Initializing");
+    printf("CPU init (MIDR: 0x%lx)...\n", mrs(MIDR_EL1));
+    const char *type = init_cpu();
+    printf("  CPU: %s\n\n", type);
+
+    printf("boot_args at %p\n", boot_args);
+
+    dump_boot_args(&cur_boot_args);
+    printf("\n");
 
     exception_initialize();
     m1n1_main();
@@ -97,6 +106,11 @@ void _start_c(void *boot_args, void *base)
 /* Secondary SMP core boot */
 void _cpu_reset_c(void *stack)
 {
+    if (mrs(MPIDR_EL1) & 0xffffff)
+        uart_puts("RVBAR entry on secondary CPU");
+    else
+        uart_puts("RVBAR entry on primary CPU");
+
     printf("\n  Stack base: %p\n", stack);
     printf("  MPIDR: 0x%lx\n", mrs(MPIDR_EL1));
     const char *type = init_cpu();

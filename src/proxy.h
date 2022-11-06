@@ -18,6 +18,11 @@ typedef enum {
     P_EL0_CALL,
     P_EL1_CALL,
     P_VECTOR,
+    P_GL1_CALL,
+    P_GL2_CALL,
+    P_GET_SIMD_STATE,
+    P_PUT_SIMD_STATE,
+    P_REBOOT,
 
     P_WRITE64 = 0x100, // Generic register functions
     P_WRITE32,
@@ -65,6 +70,10 @@ typedef enum {
     P_DC_CVAU,
     P_DC_CIVAC,
     P_MMU_SHUTDOWN,
+    P_MMU_INIT,
+    P_MMU_DISABLE,
+    P_MMU_RESTORE,
+    P_MMU_INIT_SECONDARY,
 
     P_XZDEC = 0x400, // Decompression and data processing ops
     P_GZDEC,
@@ -72,6 +81,8 @@ typedef enum {
     P_SMP_START_SECONDARIES = 0x500, // SMP and system management ops
     P_SMP_CALL,
     P_SMP_CALL_SYNC,
+    P_SMP_WAIT,
+    P_SMP_SET_WFE_MODE,
 
     P_HEAPBLOCK_ALLOC = 0x600, // Heap and memory management ops
     P_MALLOC,
@@ -79,20 +90,23 @@ typedef enum {
     P_FREE,
 
     P_KBOOT_BOOT = 0x700, // Kernel boot ops
-    P_KBOOT_SET_BOOTARGS,
+    P_KBOOT_SET_CHOSEN,
     P_KBOOT_SET_INITRD,
     P_KBOOT_PREPARE_DT,
 
-    P_PMGR_CLOCK_ENABLE = 0x800, // power/clock management ops
-    P_PMGR_CLOCK_DISABLE,
-    P_PMGR_ADT_CLOCKS_ENABLE,
-    P_PMGR_ADT_CLOCKS_DISABLE,
+    P_PMGR_POWER_ENABLE = 0x800, // power/clock management ops
+    P_PMGR_POWER_DISABLE,
+    P_PMGR_ADT_POWER_ENABLE,
+    P_PMGR_ADT_POWER_DISABLE,
+    P_PMGR_RESET,
 
     P_IODEV_SET_USAGE = 0x900,
     P_IODEV_CAN_READ,
     P_IODEV_CAN_WRITE,
     P_IODEV_READ,
     P_IODEV_WRITE,
+    P_IODEV_WHOAMI,
+    P_USB_IODEV_VUART_SETUP,
 
     P_TUNABLES_APPLY_GLOBAL = 0xa00,
     P_TUNABLES_APPLY_LOCAL,
@@ -102,6 +116,47 @@ typedef enum {
     P_DART_SHUTDOWN,
     P_DART_MAP,
     P_DART_UNMAP,
+
+    P_HV_INIT = 0xc00,
+    P_HV_MAP,
+    P_HV_START,
+    P_HV_TRANSLATE,
+    P_HV_PT_WALK,
+    P_HV_MAP_VUART,
+    P_HV_TRACE_IRQ,
+    P_HV_WDT_START,
+    P_HV_START_SECONDARY,
+    P_HV_SWITCH_CPU,
+    P_HV_SET_TIME_STEALING,
+    P_HV_PIN_CPU,
+    P_HV_WRITE_HCR,
+
+    P_FB_INIT = 0xd00,
+    P_FB_SHUTDOWN,
+    P_FB_BLIT,
+    P_FB_UNBLIT,
+    P_FB_FILL,
+    P_FB_CLEAR,
+    P_FB_DISPLAY_LOGO,
+    P_FB_RESTORE_LOGO,
+    P_FB_IMPROVE_LOGO,
+
+    P_PCIE_INIT = 0xe00,
+    P_PCIE_SHUTDOWN,
+
+    P_NVME_INIT = 0xf00,
+    P_NVME_SHUTDOWN,
+    P_NVME_READ,
+    P_NVME_FLUSH,
+
+    P_MCC_GET_CARVEOUTS = 0x1000,
+
+    P_DISPLAY_INIT = 0x1100,
+    P_DISPLAY_CONFIGURE,
+    P_DISPLAY_SHUTDOWN,
+
+    P_DAPF_INIT_ALL = 0x1200,
+    P_DAPF_INIT,
 
 } ProxyOp;
 

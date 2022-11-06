@@ -82,6 +82,7 @@ const void *adt_getprop_by_offset(const void *adt, int offset, const char **name
 const void *adt_getprop_namelen(const void *adt, int nodeoffset, const char *name, size_t namelen,
                                 u32 *lenp);
 const void *adt_getprop(const void *adt, int nodeoffset, const char *name, u32 *lenp);
+int adt_setprop(void *adt, int nodeoffset, const char *name, void *value, size_t len);
 int adt_getprop_copy(const void *adt, int nodeoffset, const char *name, void *out, size_t len);
 
 #define ADT_GETPROP(adt, nodeoffset, name, val)                                                    \
@@ -91,6 +92,7 @@ int adt_getprop_copy(const void *adt, int nodeoffset, const char *name, void *ou
     adt_getprop_copy(adt, nodeoffset, name, (arr), sizeof(arr))
 
 int adt_get_reg(const void *adt, int *path, const char *prop, int idx, u64 *addr, u64 *size);
+bool adt_is_compatible(const void *adt, int nodeoffset, const char *compat);
 
 #define ADT_FOREACH_CHILD(adt, node)                                                               \
     for (int _child_count = adt_get_child_count(adt, node); _child_count; _child_count = 0)        \

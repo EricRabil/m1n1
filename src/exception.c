@@ -1,14 +1,19 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "exception.h"
+#include "aic.h"
+#include "aic_regs.h"
 #include "cpu_regs.h"
+#include "gxf.h"
+#include "iodev.h"
+#include "memory.h"
 #include "uart.h"
 #include "utils.h"
 
 #define EL0_STACK_SIZE 0x4000
 
 u8 el0_stack[EL0_STACK_SIZE] ALIGNED(64);
-void *el0_stack_base = &el0_stack[EL0_STACK_SIZE];
+void *el0_stack_base = (void *)(u64)(&el0_stack[EL0_STACK_SIZE]);
 
 extern char _vectors_start[0];
 extern char _el1_vectors_start[0];
@@ -25,6 +30,14 @@ static char *m_table[0x10] = {
     [0x05] = "EL1h", //
     [0x08] = "EL2t", //
     [0x09] = "EL2h", //
+};
+
+static char *gl_m_table[0x10] = {
+    [0x00] = "GL0t", //
+    [0x04] = "GL1t", //
+    [0x05] = "GL1h", //
+    [0x08] = "GL2t", //
+    [0x09] = "GL2h", //
 };
 
 static char *ec_table[0x40] = {
@@ -71,10 +84,60 @@ static char *ec_table[0x40] = {
     [0x3c] = "brk (a64)",
 };
 
+static const char *get_exception_source(u64 spsr)
+{
+    u64 aspsr = in_gl12() ? mrs(SYS_IMP_APL_ASPSR_GL1) : 0;
+    const char *m_desc = NULL;
+
+    if (aspsr & 1)
+        m_desc = gl_m_table[spsr & 0xf];
+    else
+        m_desc = m_table[spsr & 0xf];
+
+    if (!m_desc)
+        m_desc = "?";
+
+    return m_desc;
+}
+
+static const char *get_exception_level(void)
+{
+    u64 lvl = mrs(CurrentEL);
+
+    if (in_gl12()) {
+        if (lvl == 0x04)
+            return "GL1";
+        else if (lvl == 0x08)
+            return "GL2";
+    } else {
+        if (lvl == 0x04)
+            return "EL1";
+        else if (lvl == 0x08)
+            return "EL2";
+    }
+
+    return "?";
+}
+
 void exception_initialize(void)
 {
     msr(VBAR_EL1, _vectors_start);
-    msr(DAIF, 0 << 6); // Enable SError, IRQ and FIQ
+
+    // Clear FIQ sources
+    msr(CNTP_CTL_EL0, 7L);
+    msr(CNTV_CTL_EL0, 7L);
+    if (in_el2()) {
+        msr(CNTP_CTL_EL02, 7L);
+        msr(CNTV_CTL_EL02, 7L);
+    }
+    reg_clr(SYS_IMP_APL_PMCR0, PMCR0_IACT | PMCR0_IMODE_MASK);
+    reg_clr(SYS_IMP_APL_UPMCR0, UPMCR0_IMODE_MASK);
+    msr(SYS_IMP_APL_IPI_SR_EL1, IPI_SR_PENDING);
+
+    if (is_primary_core())
+        msr(DAIF, 0 << 6); // Enable SError, IRQ and FIQ
+    else
+        msr(DAIF, 3 << 6); // Disable IRQ and FIQ
 
     if (in_el2()) {
         // Set up a sane HCR_EL2
@@ -101,14 +164,15 @@ void exception_shutdown(void)
 
 void print_regs(u64 *regs, int el12)
 {
+    bool in_gl;
     u64 sp = ((u64)(regs)) + 256;
 
-    u64 spsr = el12 ? mrs(SPSR_EL12) : mrs(SPSR_EL1);
+    in_gl = in_gl12();
 
-    const char *m_desc = m_table[spsr & 0xf];
-    printf("Exception taken from %s\n", m_desc ? m_desc : "?");
+    u64 spsr = in_gl ? mrs(SYS_IMP_APL_SPSR_GL1) : (el12 ? mrs(SPSR_EL12) : mrs(SPSR_EL1));
 
-    printf("Running in EL%d\n", mrs(CurrentEL) >> 2);
+    printf("Exception taken from %s\n", get_exception_source(spsr));
+    printf("Running in %s\n", get_exception_level());
     printf("MPIDR: 0x%lx\n", mrs(MPIDR_EL1));
     printf("Registers: (@%p)\n", regs);
     printf("  x0-x3: %016lx %016lx %016lx %016lx\n", regs[0], regs[1], regs[2], regs[3]);
@@ -120,44 +184,47 @@ void print_regs(u64 *regs, int el12)
     printf("x24-x27: %016lx %016lx %016lx %016lx\n", regs[24], regs[25], regs[26], regs[27]);
     printf("x28-x30: %016lx %016lx %016lx\n", regs[28], regs[29], regs[30]);
 
-    u64 elr = el12 ? mrs(ELR_EL12) : mrs(ELR_EL1);
-    u64 esr = el12 ? mrs(ESR_EL12) : mrs(ESR_EL1);
+    u64 elr = in_gl ? mrs(SYS_IMP_APL_ELR_GL1) : (el12 ? mrs(ELR_EL12) : mrs(ELR_EL1));
+    u64 esr = in_gl ? mrs(SYS_IMP_APL_ESR_GL1) : (el12 ? mrs(ESR_EL12) : mrs(ESR_EL1));
+    u64 far = in_gl ? mrs(SYS_IMP_APL_FAR_GL1) : (el12 ? mrs(FAR_EL12) : mrs(FAR_EL1));
 
     printf("PC:       0x%lx (rel: 0x%lx)\n", elr, elr - (u64)_base);
     printf("SP:       0x%lx\n", sp);
-    printf("SPSR_EL1: 0x%lx\n", spsr);
-    printf("FAR_EL1:  0x%lx\n", el12 ? mrs(FAR_EL12) : mrs(FAR_EL1));
+    printf("SPSR:     0x%lx\n", spsr);
+    if (in_gl12()) {
+        printf("ASPSR:    0x%lx\n", mrs(SYS_IMP_APL_ASPSR_GL1));
+    }
+    printf("FAR:      0x%lx\n", far);
 
     const char *ec_desc = ec_table[(esr >> 26) & 0x3f];
-    printf("ESR_EL1:  0x%lx (%s)\n", esr, ec_desc ? ec_desc : "?");
+    printf("ESR:      0x%lx (%s)\n", esr, ec_desc ? ec_desc : "?");
 
-    u64 l2c_err_sts = mrs(SYS_APL_L2C_ERR_STS);
-
-    printf("L2C_ERR_STS: 0x%lx\n", l2c_err_sts);
-    printf("L2C_ERR_ADR: 0x%lx\n", mrs(SYS_APL_L2C_ERR_ADR));
-    printf("L2C_ERR_INF: 0x%lx\n", mrs(SYS_APL_L2C_ERR_INF));
-
-    msr(SYS_APL_L2C_ERR_STS, l2c_err_sts); // Clear the flag bits
+    u64 sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
+    printf("L2C_ERR_STS: 0x%lx\n", sts);
+    printf("L2C_ERR_ADR: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_ADR));
+    printf("L2C_ERR_INF: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_INF));
+    msr(SYS_IMP_APL_L2C_ERR_STS, sts);
 
     if (is_ecore()) {
-        printf("SYS_APL_E_LSU_ERR_STS: 0x%lx\n", mrs(SYS_APL_E_LSU_ERR_STS));
-        printf("SYS_APL_E_FED_ERR_STS: 0x%lx\n", mrs(SYS_APL_E_FED_ERR_STS));
-        printf("SYS_APL_E_MMU_ERR_STS: 0x%lx\n", mrs(SYS_APL_E_MMU_ERR_STS));
+        printf("E_LSU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_LSU_ERR_STS));
+        printf("E_FED_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_FED_ERR_STS));
+        printf("E_MMU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_MMU_ERR_STS));
     } else {
-        printf("SYS_APL_LSU_ERR_STS: 0x%lx\n", mrs(SYS_APL_LSU_ERR_STS));
-        printf("SYS_APL_FED_ERR_STS: 0x%lx\n", mrs(SYS_APL_FED_ERR_STS));
-        printf("SYS_APL_MMU_ERR_STS: 0x%lx\n", mrs(SYS_APL_MMU_ERR_STS));
+        printf("LSU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_LSU_ERR_STS));
+        printf("FED_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_FED_ERR_STS));
+        printf("MMU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_MMU_ERR_STS));
     }
 }
 
 void exc_sync(u64 *regs)
 {
-    u64 elr;
     u32 insn;
     int el12 = 0;
+    bool in_gl = in_gl12();
 
-    u64 spsr = mrs(SPSR_EL1);
-    u64 esr = mrs(ESR_EL1);
+    u64 spsr = in_gl ? mrs(SYS_IMP_APL_SPSR_GL1) : mrs(SPSR_EL1);
+    u64 esr = in_gl ? mrs(SYS_IMP_APL_ESR_GL1) : mrs(ESR_EL1);
+    u64 elr = in_gl ? mrs(SYS_IMP_APL_ELR_GL1) : mrs(ELR_EL1);
 
     if ((spsr & 0xf) == 0 && ((esr >> 26) & 0x3f) == 0x3c) {
         // On clean EL0 return, let the normal exception return
@@ -167,7 +234,7 @@ void exc_sync(u64 *regs)
         return;
     }
 
-    if (in_el2() && (spsr & 0xf) == 5 && ((esr >> 26) & 0x3f) == 0x16) {
+    if (in_el2() && !in_gl12() && (spsr & 0xf) == 5 && ((esr >> 26) & 0x3f) == 0x16) {
         // Hypercall
         u32 imm = mrs(ESR_EL2) & 0xffff;
         switch (imm) {
@@ -191,7 +258,7 @@ void exc_sync(u64 *regs)
         }
     } else {
         if (!(exc_guard & GUARD_SILENT))
-            uart_puts("Exception: SYNC");
+            printf("Exception: SYNC\n");
     }
 
     sysop("isb");
@@ -200,15 +267,18 @@ void exc_sync(u64 *regs)
     if (!(exc_guard & GUARD_SILENT))
         print_regs(regs, el12);
 
+    u64 l2c_err_sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
+    msr(SYS_IMP_APL_L2C_ERR_STS, l2c_err_sts); // Clear the L2C_ERR flag bits
+
     switch (exc_guard & GUARD_TYPE_MASK) {
         case GUARD_SKIP:
-            elr = mrs(ELR_EL1) + 4;
+            elr += 4;
             break;
         case GUARD_MARK:
             // Assuming this is a load or store, dest reg is in low bits
-            insn = read32(mrs(ELR_EL1));
+            insn = read32(elr);
             regs[insn & 0x1f] = 0xacce5515abad1dea;
-            elr = mrs(ELR_EL1) + 4;
+            elr += 4;
             break;
         case GUARD_RETURN:
             regs[0] = 0xacce5515abad1dea;
@@ -217,14 +287,18 @@ void exc_sync(u64 *regs)
             break;
         case GUARD_OFF:
         default:
-            reboot();
+            printf("Unhandled exception, rebooting...\n");
+            flush_and_reboot();
     }
 
     exc_count++;
 
     if (!(exc_guard & GUARD_SILENT))
         printf("Recovering from exception (ELR=0x%lx)\n", elr);
-    msr(ELR_EL1, elr);
+    if (in_gl)
+        msr(SYS_IMP_APL_ELR_GL1, elr);
+    else
+        msr(ELR_EL1, elr);
 
     sysop("isb");
     sysop("dsb sy");
@@ -232,69 +306,59 @@ void exc_sync(u64 *regs)
 
 void exc_irq(u64 *regs)
 {
-#ifdef DEBUG_UART_IRQS
-    u32 ucon, utrstat, uerstat, ufstat;
-    ucon = read32(0x235200004);
-    utrstat = read32(0x235200010);
-    uerstat = read32(0x235200014);
-    ufstat = read32(0x235200018);
-#endif
+    u32 reason = aic_ack();
 
-    uart_puts("Exception: IRQ");
+    printf("Exception: IRQ (from %s) die: %lu type: %lu num: %lu mpidr: %lx\n",
+           get_exception_source(0), FIELD_GET(AIC_EVENT_DIE, reason),
+           FIELD_GET(AIC_EVENT_TYPE, reason), FIELD_GET(AIC_EVENT_NUM, reason), mrs(MPIDR_EL1));
 
-    u32 reason = read32(0x23b102004);
-
-    printf(" type: %d num: %d mpidr: %x\n", reason >> 16, reason & 0xffff, mrs(MPIDR_EL1));
-
-#ifdef DEBUG_UART_IRQS
-    printf(" UCON: 0x%x\n", ucon);
-    printf(" UTRSTAT: 0x%x\n", utrstat);
-    printf(" UERSTAT: 0x%x\n", uerstat);
-    printf(" UFSTAT: 0x%x\n", ufstat);
-#endif
     UNUSED(regs);
     // print_regs(regs);
 }
 
 void exc_fiq(u64 *regs)
 {
-    const char *m_desc = m_table[mrs(SPSR_EL1) & 0xf];
-    printf("Exception: FIQ (from %s)\n", m_desc ? m_desc : "?");
+    printf("Exception: FIQ (from %s)\n", get_exception_source(0));
 
     u64 reg = mrs(CNTP_CTL_EL0);
     if (reg == 0x5) {
-        uart_puts("  PHYS timer IRQ, masking");
+        printf("  PHYS timer IRQ, masking\n");
         msr(CNTP_CTL_EL0, 7L);
     }
 
     reg = mrs(CNTV_CTL_EL0);
     if (reg == 0x5) {
-        uart_puts("  VIRT timer IRQ, masking");
+        printf("  VIRT timer IRQ, masking\n");
         msr(CNTV_CTL_EL0, 7L);
     }
 
     if (in_el2()) {
         reg = mrs(CNTP_CTL_EL02);
         if (reg == 0x5) {
-            uart_puts("  PHYS EL02 timer IRQ, masking");
+            printf("  PHYS EL02 timer IRQ, masking\n");
             msr(CNTP_CTL_EL02, 7L);
         }
         reg = mrs(CNTV_CTL_EL02);
         if (reg == 0x5) {
-            uart_puts("  VIRT EL02 timer IRQ, masking");
+            printf("  VIRT EL02 timer IRQ, masking\n");
             msr(CNTV_CTL_EL02, 7L);
         }
     }
 
-    reg = mrs(SYS_APL_PMCR0);
+    reg = mrs(SYS_IMP_APL_PMCR0);
     if ((reg & (PMCR0_IMODE_MASK | PMCR0_IACT)) == (PMCR0_IMODE_FIQ | PMCR0_IACT)) {
-        uart_puts("  PMC IRQ, masking");
-        reg_clr(SYS_APL_PMCR0, PMCR0_IACT | PMCR0_IMODE_MASK);
+        printf("  PMC IRQ, masking\n");
+        reg_clr(SYS_IMP_APL_PMCR0, PMCR0_IACT | PMCR0_IMODE_MASK);
     }
-    reg = mrs(SYS_APL_UPMCR0);
-    if ((reg & UPMCR0_IMODE_MASK) == UPMCR0_IMODE_FIQ && (mrs(SYS_APL_UPMSR) & UPMSR_IACT)) {
-        uart_puts("  UPMC IRQ, masking");
-        reg_clr(SYS_APL_UPMCR0, UPMCR0_IMODE_MASK);
+    reg = mrs(SYS_IMP_APL_UPMCR0);
+    if ((reg & UPMCR0_IMODE_MASK) == UPMCR0_IMODE_FIQ && (mrs(SYS_IMP_APL_UPMSR) & UPMSR_IACT)) {
+        printf("  UPMC IRQ, masking\n");
+        reg_clr(SYS_IMP_APL_UPMCR0, UPMCR0_IMODE_MASK);
+    }
+
+    if (mrs(SYS_IMP_APL_IPI_SR_EL1) & IPI_SR_PENDING) {
+        printf("  Fast IPI IRQ, clearing\n");
+        msr(SYS_IMP_APL_IPI_SR_EL1, IPI_SR_PENDING);
     }
 
     UNUSED(regs);
@@ -306,11 +370,19 @@ void exc_serr(u64 *regs)
     if (!(exc_guard & GUARD_SILENT))
         printf("Exception: SError\n");
 
-    sysop("isb");
     sysop("dsb sy");
+    sysop("isb");
 
     if (!(exc_guard & GUARD_SILENT))
         print_regs(regs, 0);
 
-    //     reboot();
+    if ((exc_guard & GUARD_TYPE_MASK) == GUARD_OFF) {
+        printf("Unhandled exception, rebooting...\n");
+        flush_and_reboot();
+    }
+
+    exc_count++;
+
+    sysop("dsb sy");
+    sysop("isb");
 }

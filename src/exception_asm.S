@@ -1,4 +1,7 @@
-/* spDx-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT */
+
+#include "exception.h"
+#include "memory.h"
 
 .globl exc_sync
 .globl exc_irq
@@ -10,6 +13,8 @@
 .globl _v_sp0_sync
 .type _v_sp0_sync, @function
 _v_sp0_sync:
+    msr pan, #0
+    sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
     str x30, [sp, #-16]!
     bl _exc_entry
     bl exc_sync
@@ -19,6 +24,8 @@ _v_sp0_sync:
 .globl _v_sp0_irq
 .type _v_sp0_irq, @function
 _v_sp0_irq:
+    msr pan, #0
+    sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
     str x30, [sp, #-16]!
     bl _exc_entry
     bl exc_irq
@@ -28,6 +35,8 @@ _v_sp0_irq:
 .globl _v_sp0_fiq
 .type _v_sp0_fiq, @function
 _v_sp0_fiq:
+    msr pan, #0
+    sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
     str x30, [sp, #-16]!
     bl _exc_entry
     bl exc_fiq
@@ -37,6 +46,8 @@ _v_sp0_fiq:
 .globl _v_sp0_serr
 .type _v_sp0_serr, @function
 _v_sp0_serr:
+    msr pan, #0
+    sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
     str x30, [sp, #-16]!
     bl _exc_entry
     bl exc_serr
@@ -76,10 +87,13 @@ _exc_return:
     ldp x10, x11, [sp], #16
     ldp x12, x13, [sp], #16
     ldp x14, x15, [sp], #16
-
-    add sp, sp, #112
-
+    ldp x16, x17, [sp], #16
+    ldr x18, [sp], #8
+    add sp, sp, #88
     ldr x30, [sp], #16
+
+    add sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
+
     eret
 
 .globl el0_call
@@ -100,8 +114,13 @@ el0_call:
     ldr x5, =_el0_thunk
     msr elr_el1, x5
 
+    mov x5, #REGION_RWX_EL0
+    orr x0, x0, x5
+
     ldr x5, =el0_stack_base
     ldr x5, [x5]
+    mov x6, #REGION_RW_EL0
+    orr x5, x5, x6
     msr spsel, #0
     mov sp, x5
 
@@ -130,13 +149,17 @@ el0_ret:
 el1_call:
     str x30, [sp, #-16]!
 
-    // Enable EL1
+    // Enable EL1, but only if not already done.
+    // this check is here because writes to hcr_el2 are only possible from GL2
+    // if that mode has been enabled
     mrs x5, hcr_el2
-    bic x5, x5, #(1 << 27)
-    msr hcr_el2, x5
+    bic x6, x5, #(1 << 27)
+    cmp x5, x6
+    beq 1f
+    msr hcr_el2, x6
     isb
 
-    mrs x5, daif
+    1: mrs x5, daif
     msr daifclr, 3
     mov x6, #5
     orr x5, x5, x6 // EL1h
@@ -147,8 +170,7 @@ el1_call:
 
     ldr x5, =el0_stack_base
     ldr x5, [x5]
-    msr spsel, #0
-    mov sp, x5
+    msr sp_el1, x5
 
     eret
 
