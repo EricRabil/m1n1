@@ -101,6 +101,7 @@ OBJECTS := \
 	iodev.o \
 	iova.o \
 	kboot.o \
+	macho.o \
 	main.o \
 	mcc.o \
 	memory.o memory_asm.o \

@@ -7,6 +7,7 @@
 #include "display.h"
 #include "heapblock.h"
 #include "kboot.h"
+#include "macho.h"
 #include "smp.h"
 #include "utils.h"
 
@@ -17,14 +18,15 @@
 // Kernels must be 2MB aligned
 #define KERNEL_ALIGN (2 << 20)
 
+const u8 empty[] = {0, 0, 0, 0};
 static const u8 gz_magic[] = {0x1f, 0x8b};
 static const u8 xz_magic[] = {0xfd, '7', 'z', 'X', 'Z', 0x00};
 static const u8 fdt_magic[] = {0xd0, 0x0d, 0xfe, 0xed};
 static const u8 kernel_magic[] = {'A', 'R', 'M', 0x64};          // at 0x38
 static const u8 cpio_magic[] = {'0', '7', '0', '7', '0'};        // '1' or '2' next
+static const u8 macho_magic[] = {0xcf, 0xfa, 0xed, 0xfe};
 static const u8 img4_magic[] = {0x16, 0x04, 'I', 'M', 'G', '4'}; // IA5String 'IMG4'
 static const u8 sig_magic[] = {'m', '1', 'n', '1', '_', 's', 'i', 'g'};
-static const u8 empty[] = {0, 0, 0, 0};
 
 static char expect_compatible[256];
 static struct kernel_header *kernel = NULL;
@@ -208,6 +210,9 @@ static void *load_one_payload(void *start, size_t size)
     } else if (!memcmp(p + 0x38, kernel_magic, sizeof kernel_magic)) {
         printf("Found a kernel at %p\n", p);
         return load_kernel(p, size);
+    } else if (!memcmp(p, macho_magic, sizeof macho_magic)) {
+        printf("Found a Mach-O image at %p\n", p);
+        return macho_load(p, size);
     } else if (!memcmp(p, sig_magic, sizeof sig_magic)) {
         u32 size;
         memcpy(&size, p + 8, 4);
@@ -249,6 +254,8 @@ int payload_run(void)
     while (p)
         p = load_one_payload(p, 0);
 
+    if (macho_boot)
+        return macho_boot();
     if (chainload_spec) {
         return chainload_load(chainload_spec, chosen, chosen_cnt);
     }
